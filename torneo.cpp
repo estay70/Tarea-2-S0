@@ -500,3 +500,526 @@ struct Servidor {
     std::atomic<long> movs_total{0};
     std::atomic<long> colisiones_total{0};
 };
+static void lock_board(Mesa& m) {
+    int r = pthread_mutex_lock(&m.board_mx);
+    if (r == EOWNERDEAD) {
+        pthread_mutex_consistent(&m.board_mx);
+        LOG.msg(m.id, "Mutex del tablero RECUPERADO tras la caida de su dueno (EOWNERDEAD)");
+    } else if (r != 0) {
+        LOG.msg(m.id, "ERROR fatal al tomar el tablero: %s", strerror(r));
+        abort();
+    }
+}
+struct BoardLock {
+    Mesa& m;
+    explicit BoardLock(Mesa& mm) : m(mm) { lock_board(m); }
+    ~BoardLock() { pthread_mutex_unlock(&m.board_mx); }
+    BoardLock(const BoardLock&) = delete;
+    BoardLock& operator=(const BoardLock&) = delete;
+};
+static void mesa_init(Mesa& m) {
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_setrobust(&a, PTHREAD_MUTEX_ROBUST);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_ERRORCHECK);
+    pthread_mutex_init(&m.board_mx, &a);
+    pthread_mutexattr_destroy(&a);
+    pthread_mutex_init(&m.meta_mx, nullptr);
+    init_cond(&m.meta_cv);
+    estado_inicial(m.st, *m.cfg);
+    m.activas = 1 + static_cast<int>(m.cfg->perros.size());
+    m.beat[0] = m.beat[1] = now_ms();
+    m.movs_lado[0] = m.movs_lado[1] = 0;
+    m.muerto[0] = m.muerto[1] = false;
+    m.caida[0] = m.caida[1] = false;
+}
+static void mesa_destroy(Mesa& m) {
+    pthread_cond_destroy(&m.meta_cv);
+    pthread_mutex_destroy(&m.meta_mx);
+    pthread_mutex_destroy(&m.board_mx);
+}
+static bool finalizar(Mesa& m, int res) {
+    int esperado = EN_CURSO;
+    if (!m.resultado.compare_exchange_strong(esperado, res)) return false;
+    pthread_mutex_lock(&m.meta_mx);  // orden: board_mx -> meta_mx
+    pthread_cond_broadcast(&m.meta_cv);
+    pthread_mutex_unlock(&m.meta_mx);
+    return true;
+}
+static void esperar(Mesa& m, long ms) {
+    const long limite = now_ms() + ms;
+    pthread_mutex_lock(&m.meta_mx);
+    while (m.resultado.load() == EN_CURSO) {
+        const long resto = limite - now_ms();
+        if (resto <= 0) break;
+        cond_wait_ms(&m.meta_cv, &m.meta_mx, resto);
+    }
+    pthread_mutex_unlock(&m.meta_mx);
+}
+static void pieza_termina(Mesa& m) {
+    pthread_mutex_lock(&m.meta_mx);
+    --m.activas;
+    pthread_cond_broadcast(&m.meta_cv);
+    pthread_mutex_unlock(&m.meta_mx);
+}
+enum { MOV_OK, MOV_CHOQUE, MOV_FIN };
+static string nombre_pieza(int p) { return p == PUMA_ID ? string("Puma") : "Perro " + std::to_string(p + 1); }
+static int intentar(Mesa& m, int pieza, Mov mv) {
+    BoardLock g(m);
+    if (m.resultado.load() != EN_CURSO) return MOV_FIN;
+    Estado& s = m.st;
+    if (!s.viva[pieza]) return MOV_FIN;
+    vector<Mov> v;
+    movs_validos(s, pieza, v);  
+    const bool legal = std::any_of(v.begin(), v.end(), [&](const Mov& x) { return x.to == mv.to && x.over == mv.over; });
+    if (!legal) {
+        m.colisiones.fetch_add(1);
+        LOG.msg(m.id, "%s pierde la carrera por %s (casilla ya ocupada) -> colision", nombre_pieza(pieza).c_str(),
+                nombre_nodo(mv.to).c_str());
+        return MOV_CHOQUE;
+    }
+    const int from = s.pos[pieza];
+    s.cell[from] = LIBRE;
+    s.cell[mv.to] = static_cast<int8_t>(pieza);
+    s.pos[pieza] = mv.to;
+    ++s.movs;
+    if (mv.over >= 0) {
+        const int dog = s.cell[mv.over];
+        s.cell[mv.over] = LIBRE;
+        s.viva[dog] = false;
+        ++s.capturas;
+        LOG.msg(m.id, "Puma salta %s -> %s y captura a %s en %s [capturas=%d/%d]", nombre_nodo(from).c_str(),
+                nombre_nodo(mv.to).c_str(), nombre_pieza(dog).c_str(), nombre_nodo(mv.over).c_str(), s.capturas,
+                m.cfg->capturas);
+    } else {
+        LOG.msg(m.id, "%s: %s -> %s", nombre_pieza(pieza).c_str(), nombre_nodo(from).c_str(),
+                nombre_nodo(mv.to).c_str());
+    }
+    bool terminal = false;
+    if (s.capturas >= m.cfg->capturas) {
+        terminal = finalizar(m, GANA_PUMA);
+    } else {
+        vector<Mov> vp;
+        movs_validos(s, PUMA_ID, vp);
+        if (vp.empty()) terminal = finalizar(m, GANAN_PERROS);
+        else if (s.movs >= m.cfg->max_movs) terminal = finalizar(m, TABLAS);
+    }
+    if (!terminal && s.movs % m.cfg->imprimir_cada == 0)
+        LOG.bloque("Tablero (mov " + std::to_string(s.movs) + "):\n" + tablero_str(s));
+    return MOV_OK;
+}
+static bool expuesto(const Estado& t, int nodo) {
+    const int pp = t.pos[PUMA_ID];
+    for (const auto& sj : TOPO.saltos[pp])
+        if (sj.first == nodo && t.cell[sj.second] == LIBRE) return true;
+    return false;
+}
+static Mov elegir_puma(const Estado& s, const vector<Mov>& mv, std::mt19937& rng) {
+    vector<Mov> saltos;
+    for (const Mov& x : mv)
+        if (x.over >= 0) saltos.push_back(x);
+    if (!saltos.empty()) return saltos[rng() % saltos.size()];
+    if (rng() % 100 < 70) {
+        int mejor = 1 << 30;
+        vector<Mov> emp;
+        for (const Mov& x : mv) {
+            int d = 1 << 30;
+            for (int i = 0; i < MAX_PERROS; ++i)
+                if (s.viva[i]) d = std::min(d, dist(x.to, s.pos[i]));
+            if (d < mejor) {
+                mejor = d;
+                emp.clear();
+            }
+            if (d == mejor) emp.push_back(x);
+        }
+        if (!emp.empty()) return emp[rng() % emp.size()];
+    }
+    return mv[rng() % mv.size()];
+}
+static Mov elegir_perro(const Estado& s, int pieza, const vector<Mov>& mv, std::mt19937& rng) {
+    vector<Mov> seguros;
+    for (const Mov& x : mv) {
+        Estado t = s;
+        t.cell[t.pos[pieza]] = LIBRE;
+        t.cell[x.to] = static_cast<int8_t>(pieza);
+        t.pos[pieza] = x.to;
+        if (!expuesto(t, x.to)) seguros.push_back(x);
+    }
+    const vector<Mov>& pool = seguros.empty() ? mv : seguros;
+    if (rng() % 100 < 75) {
+        int mejor = 1 << 30;
+        vector<Mov> emp;
+        for (const Mov& x : pool) {
+            const int d = dist(x.to, s.pos[PUMA_ID]);
+            if (d < mejor) {
+                mejor = d;
+                emp.clear();
+            }
+            if (d == mejor) emp.push_back(x);
+        }
+        return emp[rng() % emp.size()];
+    }
+    return pool[rng() % pool.size()];
+}
+struct PiezaArg {
+    Mesa* m;
+    int pieza;
+    int lado;      
+    bool inyectar; 
+    unsigned seed;
+};
+static void* pieza_main(void* p) {
+    PiezaArg* a = static_cast<PiezaArg*>(p);
+    Mesa& m = *a->m;
+    const Config& cfg = *m.cfg;
+    std::mt19937 rng(a->seed);
+    std::uniform_int_distribution<int> retardo(cfg.retardo_min, cfg.retardo_max);
+    vector<Mov> mv;
+    while (true) {
+        esperar(m, retardo(rng));  
+        if (m.resultado.load() != EN_CURSO) break;
+        if (m.muerto[a->lado].load()) {
+            while (m.resultado.load() == EN_CURSO) esperar(m, 200);
+            break;
+        }
+        m.beat[a->lado].store(now_ms());
+
+        Estado s;
+        {
+            BoardLock g(m);  
+            s = m.st;
+        }
+        if (!s.viva[a->pieza]) break;  
+        movs_validos(s, a->pieza, mv);
+        if (mv.empty()) continue;
+        const Mov eleg = (a->pieza == PUMA_ID) ? elegir_puma(s, mv, rng) : elegir_perro(s, a->pieza, mv, rng);
+
+        const int r = intentar(m, a->pieza, eleg);
+        if (r == MOV_FIN) {
+            if (m.resultado.load() != EN_CURSO) break;
+            continue;
+        }
+        if (r == MOV_OK) {
+            const int k = m.movs_lado[a->lado].fetch_add(1) + 1;
+            if (a->inyectar && k == cfg.fallo_tras) {
+                m.muerto[a->lado].store(true);
+                if (cfg.fallo_silencio) {
+                    LOG.msg(m.id, "!! %s (jugador cliente) se CUELGA: deja de responder sin morir",
+                            a->lado == 0 ? "Puma" : "Perros");
+                    continue;
+                }
+                lock_board(m);
+                LOG.msg(m.id, "!! %s (jugador cliente) FALLA y muere reteniendo el mutex del tablero",
+                        a->lado == 0 ? "Puma" : "Perros");
+                m.caida[a->lado].store(true);  
+                pieza_termina(m);
+                return nullptr;  
+            }
+        }
+    }
+    pieza_termina(m);
+    return nullptr;
+}
+static void asignar(Cliente* c, Mesa* m) {
+    pthread_mutex_lock(&c->mx);
+    c->mesa = m;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mx);
+}
+static void cancelar(Cliente* c) {
+    pthread_mutex_lock(&c->mx);
+    if (!c->mesa) c->cancelado = true;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mx);
+}
+static void* juez_main(void* arg) {
+    Mesa* mp = static_cast<Mesa*>(arg);
+    Mesa& m = *mp;
+    Servidor* S = m.srv;
+    const Config& cfg = *m.cfg;
+    mesa_init(m);
+    LOG.msg(m.id, "Juez: mesa abierta. Puma=Cliente %d, Perros=Cliente %d (mesas en uso: %d/%d)", m.jug[0]->id,
+            m.jug[1]->id, S->mesas_en_uso.load(), S->M);
+    {
+        BoardLock g(m);
+        LOG.bloque("Tablero inicial:\n" + tablero_str(m.st));
+    }
+    m.beat[0] = m.beat[1] = now_ms();
+    asignar(m.jug[0], mp);  
+    asignar(m.jug[1], mp);
+    while (m.resultado.load() == EN_CURSO) {
+        esperar(m, 100);
+        if (m.resultado.load() != EN_CURSO) break;
+        if (g_stop.load()) {
+            anunciar_sigint();
+            finalizar(m, INTERRUMPIDA);
+            break;
+        }
+        const long t = now_ms();
+        for (int lado = 0; lado < 2; ++lado) {
+            if (m.caida[lado].load()) {
+                LOG.msg(m.id, "Juez: detecta la CAIDA del jugador %s (hilo terminado de forma anomala) -> abandono",
+                        lado == 0 ? "Puma" : "Perros");
+                finalizar(m, lado == 0 ? ABANDONO_PUMA : ABANDONO_PERROS);
+                break;
+            }
+            if (t - m.beat[lado].load() > cfg.timeout_abandono) {
+                LOG.msg(m.id, "Juez: el bando %s no da senales de vida hace %ld ms -> abandono",
+                        lado == 0 ? "Puma" : "Perros", t - m.beat[lado].load());
+                finalizar(m, lado == 0 ? ABANDONO_PUMA : ABANDONO_PERROS);
+                break;
+            }
+        }
+    }
+    pthread_mutex_lock(&m.meta_mx);
+    while (m.activas > 0) cond_wait_ms(&m.meta_cv, &m.meta_mx, 100);
+    pthread_mutex_unlock(&m.meta_mx);
+    const int res = m.resultado.load();
+    string fin;
+    int movs, caps;
+    {
+        BoardLock g(m);
+        fin = tablero_str(m.st);
+        movs = m.st.movs;
+        caps = m.st.capturas;
+    }
+    const int col = m.colisiones.load();
+    LOG.bloque("Tablero final:\n" + fin);
+    LOG.msg(m.id, "FIN: %s | movimientos=%d capturas=%d colisiones=%d", texto_resultado(res).c_str(), movs, caps, col);
+    const int mid = m.id;
+    mesa_destroy(m);
+    S->res[res].fetch_add(1);
+    S->movs_total.fetch_add(movs);
+    S->colisiones_total.fetch_add(col);
+    S->mesas_en_uso.fetch_sub(1);
+    delete mp;
+    sem_post(&S->mesas);
+    LOG.msg(mid, "Mesa liberada");
+    return nullptr;
+}
+static void* matchmaker_main(void* arg) {
+    Servidor& S = *static_cast<Servidor*>(arg);
+    vector<pthread_t> jueces;
+    while (!g_stop.load() && S.pares_formados.load() < S.pares_totales) {
+        Cliente* par[2] = {nullptr, nullptr};
+        pthread_mutex_lock(&S.mx);
+        while (!g_stop.load() && !(!S.cola[0].empty() && !S.cola[1].empty())) cond_wait_ms(&S.cv, &S.mx, 100);
+        if (g_stop.load()) {
+            pthread_mutex_unlock(&S.mx);
+            break;
+        }
+        par[0] = S.cola[0].front();
+        S.cola[0].pop_front();
+        par[1] = S.cola[1].front();
+        S.cola[1].pop_front();
+        pthread_mutex_unlock(&S.mx);
+        LOG.msg(-1, "Emparejados: Cliente %d (Puma) vs Cliente %d (Perros)", par[0]->id, par[1]->id);
+        bool ok = false;
+        bool avisado = false;
+        while (!g_stop.load()) {
+            timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_nsec += 100 * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) {
+                ts.tv_sec += 1;
+                ts.tv_nsec -= 1000000000L;
+            }
+            if (sem_timedwait(&S.mesas, &ts) == 0) {
+                ok = true;
+                break;
+            }
+            if (!avisado && S.mesas_en_uso.load() >= S.M) {
+                LOG.msg(-1, "Las %d mesas estan ocupadas: el par (%d,%d) espera pasivamente", S.M, par[0]->id,
+                        par[1]->id);
+                avisado = true;
+            }
+        }
+        if (!ok) {
+            anunciar_sigint();
+            cancelar(par[0]);
+            cancelar(par[1]);
+            break;
+        }
+        const int en_uso = S.mesas_en_uso.fetch_add(1) + 1;
+        int prev = S.max_mesas.load();
+        while (en_uso > prev && !S.max_mesas.compare_exchange_weak(prev, en_uso)) {
+        }
+        S.pares_formados.fetch_add(1);
+        Mesa* m = new Mesa();
+        m->id = S.mesa_seq.fetch_add(1) + 1;
+        m->cfg = S.cfg;
+        m->srv = &S;
+        m->jug[0] = par[0];
+        m->jug[1] = par[1];
+        pthread_t tid;
+        if (pthread_create(&tid, nullptr, juez_main, m) != 0) {
+            LOG.msg(-1, "ERROR: no se pudo crear el juez de la mesa %d", m->id);
+            S.mesas_en_uso.fetch_sub(1);
+            delete m;
+            sem_post(&S.mesas);
+            cancelar(par[0]);
+            cancelar(par[1]);
+            continue;
+        }
+        jueces.push_back(tid);
+    }
+    pthread_mutex_lock(&S.mx);
+    S.cerrado = true;
+    vector<Cliente*> huerfanos;
+    for (int r = 0; r < 2; ++r) {
+        for (Cliente* c : S.cola[r]) huerfanos.push_back(c);
+        S.cola[r].clear();
+    }
+    pthread_mutex_unlock(&S.mx);
+    for (Cliente* c : huerfanos) cancelar(c);
+
+    for (pthread_t t : jueces) pthread_join(t, nullptr);
+    return nullptr;
+}
+static bool encolar(Servidor& S, Cliente* c) {
+    pthread_mutex_lock(&S.mx);
+    const bool ok = !S.cerrado;
+    if (ok) {
+        S.cola[c->rol].push_back(c);
+        pthread_cond_broadcast(&S.cv);
+    }
+    pthread_mutex_unlock(&S.mx);
+    return ok;
+}
+static void* cliente_main(void* arg) {
+    Cliente* c = static_cast<Cliente*>(arg);
+    Servidor& S = *c->srv;
+    const Config& cfg = *S.cfg;
+    c->rol = c->id % 2;  
+    LOG.msg(-1, "Cliente %d llega y pide jugar como %s", c->id, c->rol == 0 ? "Puma" : "Perros");
+
+    if (!encolar(S, c)) {
+        LOG.msg(-1, "Cliente %d: el torneo ya no acepta jugadores", c->id);
+        return nullptr;
+    }
+    pthread_mutex_lock(&c->mx);
+    while (!c->mesa && !c->cancelado) cond_wait_ms(&c->cv, &c->mx, 100);
+    Mesa* m = c->mesa;
+    pthread_mutex_unlock(&c->mx);
+    if (!m) {
+        LOG.msg(-1, "Cliente %d se va sin jugar (sin pareja o torneo detenido)", c->id);
+        return nullptr;
+    }
+    const int mid = m->id;
+    const int lado = c->rol;
+    const bool inyectar = std::find(cfg.fallo_jugadores.begin(), cfg.fallo_jugadores.end(), c->id) != cfg.fallo_jugadores.end();
+    const int n = (lado == 0) ? 1 : static_cast<int>(cfg.perros.size());
+    vector<PiezaArg> args(n);
+    vector<pthread_t> th(n);
+    vector<bool> lanzado(n, false);
+    for (int i = 0; i < n; ++i) {
+        args[i].m = m;
+        args[i].pieza = (lado == 0) ? PUMA_ID : i;
+        args[i].lado = lado;
+        args[i].inyectar = inyectar;
+        args[i].seed = cfg.seed + static_cast<unsigned>(c->id) * 7919u + static_cast<unsigned>(i) * 104729u;
+        if (pthread_create(&th[i], nullptr, pieza_main, &args[i]) == 0) lanzado[i] = true;
+        else pieza_termina(*m);  // no arranco: descontarla para no bloquear al juez
+    }
+    for (int i = 0; i < n; ++i)
+        if (lanzado[i]) pthread_join(th[i], nullptr);
+    LOG.msg(-1, "Cliente %d (%s) termina su participacion en la mesa %d", c->id, lado == 0 ? "Puma" : "Perros", mid);
+    return nullptr;
+}
+static void uso(const char* prog) {
+    fprintf(stderr, "Uso: %s N M [config.txt]\n  N: total de clientes, M: maximo de mesas simultaneas\n", prog);
+}
+int main(int argc, char** argv) {
+    if (argc < 3 || argc > 4) {
+        uso(argv[0]);
+        return 1;
+    }
+    char *e1 = nullptr, *e2 = nullptr;
+    const long N = strtol(argv[1], &e1, 10);
+    const long M = strtol(argv[2], &e2, 10);
+    if (*argv[1] == '\0' || *e1 != '\0' || *argv[2] == '\0' || *e2 != '\0' || N < 1 || M < 1 || N > 100000 || M > 10000) {
+        fprintf(stderr, "Error: N y M deben ser enteros positivos\n");
+        uso(argv[0]);
+        return 1;
+    }
+    Config cfg;
+    string err;
+    if (argc == 4 && !cargar_config(argv[3], cfg, err)) {
+        fprintf(stderr, "Error de configuracion: %s\n", err.c_str());
+        return 1;
+    }
+    if (!validar_config(cfg, err)) {
+        fprintf(stderr, "Configuracion invalida: %s\n", err.c_str());
+        return 1;
+    }
+    construir_topologia(cfg.diagonales);
+    LOG.abrir(cfg.log_archivo, cfg.consola);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  
+    sigaction(SIGINT, &sa, nullptr);
+    Servidor S;
+    S.cfg = &cfg;
+    S.N = static_cast<int>(N);
+    S.M = static_cast<int>(M);
+    S.pares_totales = S.N / 2;
+    sem_init(&S.mesas, 0, static_cast<unsigned>(M));
+    init_cond(&S.cv);
+    for (auto& r : S.res) r.store(0);
+
+    LOG.msg(-1, "Torneo: N=%ld clientes, M=%ld mesas, seed=%u, diagonales=%d, retardo=%d..%d ms", N, M, cfg.seed,
+            cfg.diagonales ? 1 : 0, cfg.retardo_min, cfg.retardo_max);
+    pthread_t mm;
+    if (pthread_create(&mm, nullptr, matchmaker_main, &S) != 0) {
+        fprintf(stderr, "No se pudo crear el matchmaker\n");
+        return 1;
+    }
+    vector<std::unique_ptr<Cliente>> clientes;
+    vector<pthread_t> hilos;
+    std::mt19937 rng(cfg.seed);
+    std::uniform_int_distribution<int> llegada(cfg.llegada_min, cfg.llegada_max);
+    for (int i = 0; i < S.N; ++i) {
+        // espera de llegada en rebanadas para poder reaccionar a Ctrl+C
+        long resto = llegada(rng);
+        while (resto > 0 && !g_stop.load()) {
+            const long s = std::min(resto, 20L);
+            timespec ts = {0, s * 1000000L};
+            nanosleep(&ts, nullptr);
+            resto -= s;
+        }
+        if (g_stop.load()) {
+            anunciar_sigint();
+            break;
+        }
+        clientes.emplace_back(new Cliente());
+        Cliente* c = clientes.back().get();
+        c->id = i;
+        c->srv = &S;
+        pthread_t t;
+        if (pthread_create(&t, nullptr, cliente_main, c) != 0) {
+            LOG.msg(-1, "ERROR: no se pudo crear el hilo del cliente %d", i);
+            clientes.pop_back();
+            continue;
+        }
+        hilos.push_back(t);
+    }
+    for (pthread_t t : hilos) pthread_join(t, nullptr);
+    pthread_join(mm, nullptr);
+    int jugadas = 0;
+    for (int r = 1; r < N_RESULTADOS; ++r) jugadas += S.res[r].load();
+    LOG.msg(-1, "=========== RESUMEN ===========");
+    LOG.msg(-1, "Clientes atendidos: %zu de %ld | partidas: %d | maximo de mesas simultaneas: %d (limite M=%ld)",
+            clientes.size(), N, jugadas, S.max_mesas.load(), M);
+    for (int r = 1; r < N_RESULTADOS; ++r)
+        if (S.res[r].load() > 0) LOG.msg(-1, "  %-58s : %d", texto_resultado(r).c_str(), S.res[r].load());
+    LOG.msg(-1, "Movimientos totales=%ld | colisiones resueltas=%ld", S.movs_total.load(),
+            S.colisiones_total.load());
+    sem_destroy(&S.mesas);
+    pthread_cond_destroy(&S.cv);
+    pthread_mutex_destroy(&S.mx);
+    LOG.msg(-1, "Recursos liberados (semaforos, mutex, condiciones, hilos). Hasta luego.");
+    LOG.cerrar();
+    return g_stop.load() ? 130 : 0;
+}
